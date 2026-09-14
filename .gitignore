@@ -1,0 +1,12 @@
+/build*/
+/dist/
+/*.egg-info/
+/*.so
+/*.pyd
+/*.sqbf
+/*.sqsf
+/*.sf
+/*.sfs
+/*.tmp
+__pycache__/
+*.py[cod]

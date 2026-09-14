@@ -1,0 +1,27 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  doxygen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes doxygen graphviz
+      - name: Configure
+        run: >-
+          cmake -S . -B build -DBUILD_TESTING=OFF
+          -DSQUIRTLE_BUILD_EXAMPLES=OFF -DSQUIRTLE_BUILD_PYTHON=OFF
+          -DSQUIRTLE_BUILD_DOCS=ON
+      - name: Build documentation
+        run: cmake --build build --target docs

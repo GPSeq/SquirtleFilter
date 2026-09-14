@@ -1,74 +1,69 @@
 #include <benchmark/benchmark.h>
-#include "../include/SquirtleFilter.h"
-#include "../include/SFilters.h"
+
+#include "SFilters.h"
+#include "SquirtleFilter.h"
+
+#include <cstddef>
 #include <string>
+#include <vector>
 
-// === BloomFilter Benchmarks ===
+namespace {
 
-static void BM_BloomFilter_Insert(benchmark::State& state) {
-    BloomFilter bf(1000000, 0.01, 5);
-    std::string base = "key";
-    for (auto _ : state) {
-        bf.insert((base + std::to_string(state.iterations())).data(),
-                  (base + std::to_string(state.iterations())).size());
-    }
+std::vector<std::string> makeKeys(std::size_t count, const std::string& prefix) {
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) keys.push_back(prefix + std::to_string(i));
+    return keys;
 }
-BENCHMARK(BM_BloomFilter_Insert);
 
-static void BM_BloomFilter_Contains(benchmark::State& state) {
-    BloomFilter bf(1000000, 0.01, 5);
-    std::string base = "key";
-    for (int i = 0; i < 1000000; ++i) {
-        auto str = base + std::to_string(i);
-        bf.insert(str.data(), str.size());
-    }
+void BloomInsert(benchmark::State& state) {
+    const auto keys = makeKeys(65'536, "insert-");
+    BloomFilter filter(1'000'000, 0.01, 5);
+    std::size_t index{};
     for (auto _ : state) {
-        auto str = base + std::to_string(state.iterations() % 1000000);
-        benchmark::DoNotOptimize(bf.contains(str.data(), str.size()));
+        filter.insert(keys[index]);
+        index = (index + 1U) % keys.size();
     }
+    state.SetItemsProcessed(state.iterations());
 }
-BENCHMARK(BM_BloomFilter_Contains);
+BENCHMARK(BloomInsert);
 
-// === SFilters Benchmarks ===
+void BloomContains(benchmark::State& state) {
+    const auto present = makeKeys(65'536, "present-");
+    const auto absent = makeKeys(65'536, "absent-");
+    BloomFilter filter(1'000'000, 0.01, 5);
+    filter.insertMany(present);
+    const bool query_present = state.range(0) != 0;
+    const auto& keys = query_present ? present : absent;
+    std::size_t index{};
+    for (auto _ : state) {
+        benchmark::DoNotOptimize(filter.contains(keys[index]));
+        index = (index + 1U) % keys.size();
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BloomContains)->ArgName("present")->Arg(0)->Arg(1);
 
-static void BM_SFilters_Insert(benchmark::State& state) {
+void CollectionContains(benchmark::State& state) {
+    const auto filter_count = static_cast<std::size_t>(state.range(0));
+    const auto present = makeKeys(4096, "present-");
+    const auto absent = makeKeys(4096, "absent-");
     SFilters filters;
-    filters.initialize(100, 100000, 0.01, 5);
-    std::string base = "sfkey";
-    size_t idx = state.range(0) % 10;
-
+    filters.initialize(filter_count, 1000, 0.01, 5);
+    for (std::size_t i = 0; i < present.size(); ++i) filters.insert(i % filter_count, present[i]);
+    const bool query_present = state.range(1) != 0;
+    const auto& keys = query_present ? present : absent;
+    std::size_t index{};
     for (auto _ : state) {
-        filters.insert(idx, base + std::to_string(state.iterations()));
+        benchmark::DoNotOptimize(filters.contains(keys[index]));
+        index = (index + 1U) % keys.size();
     }
+    state.SetItemsProcessed(state.iterations());
 }
-BENCHMARK(BM_SFilters_Insert)->Arg(0);
+BENCHMARK(CollectionContains)
+    ->ArgsProduct({{64, 1024, 16'384}, {0, 1}})
+    ->ArgNames({"filters", "present"});
 
-static void BM_SFilters_Contains(benchmark::State& state) {
-    SFilters filters;
-    filters.initialize(100, 100000, 0.01, 5);
-    std::string base = "sfkey";
-    for (int i = 0; i < 100000; ++i) {
-        filters.insert(i % 100, base + std::to_string(i));
-    }
-
-    for (auto _ : state) {
-        benchmark::DoNotOptimize(filters.contains(base + std::to_string(state.iterations() % 100000)));
-    }
-}
-BENCHMARK(BM_SFilters_Contains);
-
-static void BM_SFilters_MatchBitVector(benchmark::State& state) {
-    SFilters filters;
-    filters.initialize(100, 100000, 0.01, 5);
-    std::string base = "match";
-    for (int i = 0; i < 100000; ++i) {
-        filters.insert(i % 100, base + std::to_string(i));
-    }
-
-    for (auto _ : state) {
-        benchmark::DoNotOptimize(filters.matchBitVector(base + std::to_string(state.iterations() % 100000)));
-    }
-}
-BENCHMARK(BM_SFilters_MatchBitVector);
+} // namespace
 
 BENCHMARK_MAIN();

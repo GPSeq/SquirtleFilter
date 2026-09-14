@@ -5,9 +5,6 @@
 #include <ctime>
 #include <iomanip>
 
-#ifndef STOPCLOCK_HPP_
-#define STOPLCOCK_HPP_
-
 class StopClock
 {
     public:
@@ -94,6 +91,3 @@ struct Durations {
     double basecalling = 0;
     double classification = 0;
 };
-
-
-#endif /* STOPCLOCK_HPP_ */

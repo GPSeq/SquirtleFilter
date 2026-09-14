@@ -1,427 +1,313 @@
 #include "SFilters.h"
-#include <cereal/archives/binary.hpp>
-#include <cstring>
+
+#include "BinaryIO.hpp"
+#include "Hash.hpp"
+#include "SquirtleFilter.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cmath>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 
 namespace {
 
-/**
- * @brief Performs a 64-bit left bitwise rotation.
- *
- * This helper mirrors the Bloom filter hashing path so that `SFilters`
- * can compute probe locations once and reuse them across all interleaved
- * filters in the collection.
- *
- * @param x The 64-bit unsigned integer to be rotated.
- * @param r The number of positions to rotate `x` to the left.
- * @return The result of rotating `x` left by `r` positions.
- */
-static inline uint64_t rotl64(uint64_t x, int8_t r) {
-    return (x << r) | (x >> (64 - r));
+constexpr std::array<char, 8> collection_magic{'S', 'Q', 'S', 'F', 'I', 'L', 'T', '\0'};
+constexpr std::uint32_t collection_format_version = 2;
+
+std::size_t nextProbe(std::size_t current, std::size_t step, std::size_t modulus) noexcept {
+    return current >= modulus - step ? current - (modulus - step) : current + step;
 }
 
-/**
- * @brief Finalizes a 64-bit hash value using a series of bitwise operations and multiplications.
- *
- * This helper uses the same MurmurHash3 finalization routine as the
- * single-filter implementation, ensuring probe compatibility between
- * `BloomFilter` and `SFilters`.
- *
- * @param k The 64-bit unsigned integer hash key to be finalized.
- * @return The 64-bit finalized hash value.
- */
-static inline uint64_t fmix64(uint64_t k) {
-    k ^= k >> 33;
-    k *= 0xff51afd7ed558ccdULL;
-    k ^= k >> 33;
-    k *= 0xc4ceb9fe1a85ec53ULL;
-    k ^= k >> 33;
-    return k;
+std::array<std::size_t, BloomFilter::max_hash_functions>
+makeProbes(const void* key, std::size_t length, std::size_t bit_count, std::uint8_t hash_count) {
+    std::uint64_t h1{};
+    std::uint64_t h2{};
+    squirtle::detail::hash128(key, length, 0, h1, h2);
+    std::array<std::size_t, BloomFilter::max_hash_functions> probes{};
+    std::size_t probe = static_cast<std::size_t>(h1 % bit_count);
+    const std::size_t step = static_cast<std::size_t>(h2 % (bit_count - 1U)) + 1U;
+    for (std::uint8_t i = 0; i < hash_count; ++i) {
+        probes[i] = probe;
+        probe = nextProbe(probe, step, bit_count);
+    }
+    return probes;
 }
 
-/**
- * @brief Computes a 128-bit MurmurHash3 hash for the given key.
- *
- * This local helper allows the interleaved `SFilters` structure to
- * derive the same logical probe positions used by `BloomFilter`.
- *
- * @param key A pointer to the data buffer to be hashed.
- * @param len The length of the data buffer in bytes.
- * @param seed The seed value for the hash function.
- * @param out1 Stores the first 64 bits of the 128-bit hash result.
- * @param out2 Stores the second 64 bits of the 128-bit hash result.
- */
-void hash128(const void* key, size_t len, uint64_t seed, uint64_t& out1, uint64_t& out2) {
-    const uint8_t* data = static_cast<const uint8_t*>(key);
-    const int nblocks = len / 16;
-
-    uint64_t h1 = seed;
-    uint64_t h2 = seed;
-
-    const uint64_t c1 = 0x87c37b91114253d5ULL;
-    const uint64_t c2 = 0x4cf5ad432745937fULL;
-
-    for (int i = 0; i < nblocks; ++i) {
-        uint64_t k1;
-        uint64_t k2;
-        std::memcpy(&k1, data + (2 * i) * sizeof(uint64_t), sizeof(uint64_t));
-        std::memcpy(&k2, data + (2 * i + 1) * sizeof(uint64_t), sizeof(uint64_t));
-
-        k1 *= c1;
-        k1 = rotl64(k1, 31);
-        k1 *= c2;
-        h1 ^= k1;
-
-        h1 = rotl64(h1, 27);
-        h1 += h2;
-        h1 = h1 * 5 + 0x52dce729;
-
-        k2 *= c2;
-        k2 = rotl64(k2, 33);
-        k2 *= c1;
-        h2 ^= k2;
-
-        h2 = rotl64(h2, 31);
-        h2 += h1;
-        h2 = h2 * 5 + 0x38495ab5;
-    }
-
-    const uint8_t* tail = data + nblocks * 16;
-    uint64_t k1 = 0;
-    uint64_t k2 = 0;
-    switch (len & 15) {
-    case 15: k2 ^= (uint64_t)tail[14] << 48;
-    case 14: k2 ^= (uint64_t)tail[13] << 40;
-    case 13: k2 ^= (uint64_t)tail[12] << 32;
-    case 12: k2 ^= (uint64_t)tail[11] << 24;
-    case 11: k2 ^= (uint64_t)tail[10] << 16;
-    case 10: k2 ^= (uint64_t)tail[9] << 8;
-    case 9:  k2 ^= (uint64_t)tail[8] << 0;
-             k2 *= c2;
-             k2 = rotl64(k2, 33);
-             k2 *= c1;
-             h2 ^= k2;
-    case 8:  k1 ^= (uint64_t)tail[7] << 56;
-    case 7:  k1 ^= (uint64_t)tail[6] << 48;
-    case 6:  k1 ^= (uint64_t)tail[5] << 40;
-    case 5:  k1 ^= (uint64_t)tail[4] << 32;
-    case 4:  k1 ^= (uint64_t)tail[3] << 24;
-    case 3:  k1 ^= (uint64_t)tail[2] << 16;
-    case 2:  k1 ^= (uint64_t)tail[1] << 8;
-    case 1:  k1 ^= (uint64_t)tail[0] << 0;
-             k1 *= c1;
-             k1 = rotl64(k1, 31);
-             k1 *= c2;
-             h1 ^= k1;
-    }
-
-    h1 ^= len;
-    h2 ^= len;
-    h1 += h2;
-    h2 += h1;
-    h1 = fmix64(h1);
-    h2 = fmix64(h2);
-    h1 += h2;
-    h2 += h1;
-    out1 = h1;
-    out2 = h2;
+std::uint64_t loadAtomic(const std::uint64_t& value) {
+    return std::atomic_ref<const std::uint64_t>(value).load(std::memory_order_relaxed);
 }
 
 } // namespace
 
-/**
- * @brief Returns the number of 64-bit words required for each filter.
- *
- * The interleaved representation stores the same logical Bloom-filter
- * bit layout for every filter, but stripes words by filter index for
- * improved locality during multi-filter queries.
- *
- * @return The number of 64-bit words required for one filter.
- */
-size_t SFilters::wordCountPerFilter() const {
-    return (bit_count + 63) / 64;
+std::size_t SFilters::filterWordCount() const noexcept {
+    return squirtle::detail::wordsForBits(num_filters);
 }
 
-/**
- * @brief Returns the physical offset for an interleaved word.
- *
- * Storage is arranged as [word0 filter0..N][word1 filter0..N]... so
- * that the same logical probe across all filters stays tightly packed.
- *
- * @param word_index The logical word index within a single filter.
- * @param filter_index The filter index inside the collection.
- * @return The physical offset in the interleaved word buffer.
- */
-size_t SFilters::interleavedOffset(size_t word_index, size_t filter_index) const {
-    return word_index * num_filters + filter_index;
+std::size_t SFilters::bitSliceOffset(std::size_t bit_index, std::size_t filter_word) const noexcept {
+    return bit_index * filterWordCount() + filter_word;
 }
 
-/**
- * @brief Checks whether a specific bit mask is set for a given filter word.
- *
- * This helper keeps the interleaved indexing logic in one place.
- *
- * @param filter_index The target filter index.
- * @param word_index The target word index.
- * @param bit_mask The bit mask to test.
- * @return `true` if the bit is set, `false` otherwise.
- */
-bool SFilters::matchWord(size_t filter_index, size_t word_index, uint64_t bit_mask) const {
-    return (interleaved_bits[interleavedOffset(word_index, filter_index)] & bit_mask) != 0;
+void SFilters::validateIndex(std::size_t index) const {
+    if (index >= num_filters) throw std::out_of_range("filter index is out of bounds");
 }
 
-/**
- * @brief Sets a bit mask for a given filter word in the interleaved layout.
- *
- * @param filter_index The target filter index.
- * @param word_index The logical word index within the filter.
- * @param bit_mask The bit mask to set.
- */
-void SFilters::setWord(size_t filter_index, size_t word_index, uint64_t bit_mask) {
-    interleaved_bits[interleavedOffset(word_index, filter_index)] |= bit_mask;
-}
+void SFilters::initialize(std::size_t number_of_filters, std::size_t expected_items,
+                          double target_rate, std::uint8_t hash_functions) {
+    const std::size_t new_bit_count = BloomFilter::computeBitCount(expected_items, target_rate, hash_functions);
+    const std::size_t word_count = squirtle::detail::wordsForBits(number_of_filters);
+    const std::size_t storage_size = squirtle::detail::checkedMultiply(new_bit_count, word_count, "SFilters storage");
+    std::vector<std::uint64_t> new_counts(number_of_filters, 0U);
+    std::vector<std::uint64_t> new_slices(storage_size, 0U);
 
-/**
- * @brief Validates that a requested filter index is inside the collection bounds.
- *
- * @param index The filter index to validate.
- * @throws std::out_of_range If the index falls outside the collection.
- */
-void SFilters::validateIndex(size_t index) const {
-    if (index >= num_filters) throw std::out_of_range("insert: index out of bounds");
-}
-
-/**
- * @brief Initializes a collection of interleaved Bloom filters.
- *
- * This method allocates a single interleaved bit store where each logical
- * Bloom-filter word is packed across all filters before moving to the next
- * word. That layout improves locality for collection-wide queries.
- *
- * @param number_of_filters The total number of Bloom filter instances to create and manage.
- * @param expected_items The approximate maximum number of items each individual Bloom filter is expected to hold.
- * @param target_false_positive_rate The desired maximum false positive rate for each Bloom filter.
- * @param hash_functions The number of hash functions to be used by each Bloom filter.
- */
-void SFilters::initialize(size_t number_of_filters, size_t expected_items, double target_false_positive_rate, uint8_t hash_functions) {
+    std::unique_lock lock(mutex);
     num_filters = number_of_filters;
-    capacity = expected_items == 0 ? 1 : expected_items;
-    false_positive_rate = target_false_positive_rate;
-    k = std::clamp<uint8_t>(hash_functions, 1, 5);
-    bit_count = BloomFilter::computeBitCount(capacity, false_positive_rate);
-
-    item_counts.assign(num_filters, 0);
-    interleaved_bits.assign(wordCountPerFilter() * num_filters, 0);
+    bit_count = new_bit_count;
+    capacity = expected_items;
+    k = hash_functions;
+    false_positive_rate = target_rate;
+    item_counts = std::move(new_counts);
+    bit_slices = std::move(new_slices);
 }
 
-/**
- * @brief Inserts a key into a specific interleaved Bloom filter.
- *
- * This method hashes the key once, derives all probe locations, and then
- * applies the resulting bit masks to the selected filter inside the shared
- * interleaved bit layout.
- *
- * @param index The zero-based index of the Bloom filter in the collection where the key should be inserted.
- * @param key The string key to be inserted into the specified Bloom filter.
- * @throws std::out_of_range If the provided `index` is greater than or equal to the number of filters.
- */
-void SFilters::insert(size_t index, const std::string& key) {
+void SFilters::insertBytesUnlocked(std::size_t index, const void* key, std::size_t length) {
     validateIndex(index);
-
-    uint64_t h1, h2;
-    hash128(key.data(), key.size(), 0, h1, h2);
-    const uint64_t base_index = h1 % bit_count;
-    const uint64_t hash2_mod = h2 % bit_count;
-    for (uint8_t i = 0; i < k; ++i) {
-        const uint64_t bit_index = (base_index + i * hash2_mod) % bit_count;
-        const size_t word_index = bit_index / 64;
-        const uint64_t bit_mask = 1ULL << (bit_index % 64);
-        setWord(index, word_index, bit_mask);
+    if (key == nullptr && length != 0U) throw std::invalid_argument("key must not be null");
+    const auto probes = makeProbes(key, length, bit_count, k);
+    const std::size_t filter_word = index / 64U;
+    const std::uint64_t filter_mask = 1ULL << (index % 64U);
+    for (std::uint8_t i = 0; i < k; ++i) {
+        std::atomic_ref<std::uint64_t>(bit_slices[bitSliceOffset(probes[i], filter_word)])
+            .fetch_or(filter_mask, std::memory_order_relaxed);
     }
-    ++item_counts[index];
+    std::atomic_ref<std::uint64_t>(item_counts[index]).fetch_add(1U, std::memory_order_relaxed);
 }
 
-/**
- * @brief Inserts a double-precision floating-point value into a specific interleaved Bloom filter.
- *
- * This overload stores the raw binary representation of the double in the
- * same way as the single-filter implementation.
- *
- * @param index The zero-based index of the Bloom filter in the collection where the double value should be inserted.
- * @param value The double-precision floating-point value to be inserted.
- * @throws std::out_of_range If the provided `index` is greater than or equal to the number of filters.
- */
-void SFilters::insert(size_t index, double value) {
+void SFilters::insert(std::size_t index, const std::string& key) {
+    std::shared_lock lock(mutex);
+    insertBytesUnlocked(index, key.data(), key.size());
+}
+
+void SFilters::insert(std::size_t index, double value) {
+    std::shared_lock lock(mutex);
+    insertBytesUnlocked(index, &value, sizeof(value));
+}
+
+void SFilters::insertMany(std::size_t index, const std::vector<std::string>& keys) {
+    std::shared_lock lock(mutex);
     validateIndex(index);
-
-    uint64_t h1, h2;
-    hash128(&value, sizeof(double), 0, h1, h2);
-    const uint64_t base_index = h1 % bit_count;
-    const uint64_t hash2_mod = h2 % bit_count;
-    for (uint8_t i = 0; i < k; ++i) {
-        const uint64_t bit_index = (base_index + i * hash2_mod) % bit_count;
-        const size_t word_index = bit_index / 64;
-        const uint64_t bit_mask = 1ULL << (bit_index % 64);
-        setWord(index, word_index, bit_mask);
-    }
-    ++item_counts[index];
+    for (const auto& key : keys) insertBytesUnlocked(index, key.data(), key.size());
 }
 
-/**
- * @brief Writes the entire interleaved collection of Bloom filters to a single binary file.
- *
- * This method serializes the collection metadata and the full interleaved
- * bit store so that the layout can be reconstructed exactly during load.
- *
- * @param output_path The file path where the serialized collection of Bloom filters will be written.
- * @throws std::runtime_error If the output file cannot be opened for writing.
- */
+void SFilters::insertMany(std::size_t index, const std::vector<double>& values) {
+    std::shared_lock lock(mutex);
+    validateIndex(index);
+    for (const double value : values) insertBytesUnlocked(index, &value, sizeof(value));
+}
+
+bool SFilters::containsBytesUnlocked(const void* key, std::size_t length) const {
+    if (num_filters == 0U) return false;
+    const auto probes = makeProbes(key, length, bit_count, k);
+    const std::size_t words = filterWordCount();
+    for (std::size_t filter_word = 0; filter_word < words; ++filter_word) {
+        std::uint64_t candidates = std::numeric_limits<std::uint64_t>::max();
+        for (std::uint8_t i = 0; i < k && candidates != 0U; ++i) {
+            candidates &= loadAtomic(bit_slices[bitSliceOffset(probes[i], filter_word)]);
+        }
+        if (filter_word + 1U == words && num_filters % 64U != 0U) {
+            candidates &= (1ULL << (num_filters % 64U)) - 1U;
+        }
+        if (candidates != 0U) return true;
+    }
+    return false;
+}
+
+bool SFilters::contains(const std::string& key) const {
+    std::shared_lock lock(mutex);
+    return containsBytesUnlocked(key.data(), key.size());
+}
+
+bool SFilters::contains(double value) const {
+    std::shared_lock lock(mutex);
+    return containsBytesUnlocked(&value, sizeof(value));
+}
+
+std::vector<std::size_t> SFilters::matchFiltersBytesUnlocked(const void* key, std::size_t length) const {
+    std::vector<std::size_t> matches;
+    if (num_filters == 0U) return matches;
+    matches.reserve(std::min<std::size_t>(num_filters, 64U));
+    const auto probes = makeProbes(key, length, bit_count, k);
+    const std::size_t words = filterWordCount();
+    for (std::size_t filter_word = 0; filter_word < words; ++filter_word) {
+        std::uint64_t candidates = std::numeric_limits<std::uint64_t>::max();
+        for (std::uint8_t i = 0; i < k && candidates != 0U; ++i) {
+            candidates &= loadAtomic(bit_slices[bitSliceOffset(probes[i], filter_word)]);
+        }
+        while (candidates != 0U) {
+            const unsigned bit = std::countr_zero(candidates);
+            const std::size_t index = filter_word * 64U + bit;
+            if (index < num_filters) matches.push_back(index);
+            candidates &= candidates - 1U;
+        }
+    }
+    return matches;
+}
+
+std::vector<std::size_t> SFilters::matchFilters(const std::string& key) const {
+    std::shared_lock lock(mutex);
+    return matchFiltersBytesUnlocked(key.data(), key.size());
+}
+
+std::vector<std::size_t> SFilters::matchFilters(double value) const {
+    std::shared_lock lock(mutex);
+    return matchFiltersBytesUnlocked(&value, sizeof(value));
+}
+
+std::vector<std::uint8_t> SFilters::matchBitVectorBytesUnlocked(const void* key, std::size_t length) const {
+    std::vector<std::uint8_t> result(num_filters, 0U);
+    if (num_filters == 0U) return result;
+    const auto probes = makeProbes(key, length, bit_count, k);
+    const std::size_t words = filterWordCount();
+    for (std::size_t filter_word = 0; filter_word < words; ++filter_word) {
+        std::uint64_t candidates = std::numeric_limits<std::uint64_t>::max();
+        for (std::uint8_t i = 0; i < k && candidates != 0U; ++i) {
+            candidates &= loadAtomic(bit_slices[bitSliceOffset(probes[i], filter_word)]);
+        }
+        while (candidates != 0U) {
+            const unsigned bit = std::countr_zero(candidates);
+            const std::size_t index = filter_word * 64U + bit;
+            if (index < num_filters) result[index] = 1U;
+            candidates &= candidates - 1U;
+        }
+    }
+    return result;
+}
+
+std::vector<std::uint8_t> SFilters::matchBitVector(const std::string& key) const {
+    std::shared_lock lock(mutex);
+    return matchBitVectorBytesUnlocked(key.data(), key.size());
+}
+
+std::vector<std::uint8_t> SFilters::matchBitVector(double value) const {
+    std::shared_lock lock(mutex);
+    return matchBitVectorBytesUnlocked(&value, sizeof(value));
+}
+
 void SFilters::writeToFile(const std::string& output_path) const {
-    std::ofstream ofs(output_path, std::ios::binary);
-    if (!ofs) throw std::runtime_error("Cannot open output file: " + output_path);
+    std::size_t stored_num_filters{};
+    std::size_t stored_bit_count{};
+    std::size_t stored_capacity{};
+    std::uint8_t stored_k{};
+    double stored_rate{};
+    std::vector<std::uint64_t> counts;
+    std::vector<std::uint64_t> slices;
+    {
+        std::shared_lock lock(mutex);
+        if (bit_count == 0U) throw std::logic_error("SFilters must be initialized before writing");
+        stored_num_filters = num_filters;
+        stored_bit_count = bit_count;
+        stored_capacity = capacity;
+        stored_k = k;
+        stored_rate = false_positive_rate;
+        counts.resize(item_counts.size());
+        slices.resize(bit_slices.size());
+        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = loadAtomic(item_counts[i]);
+        for (std::size_t i = 0; i < slices.size(); ++i) slices[i] = loadAtomic(bit_slices[i]);
+    }
 
-    cereal::BinaryOutputArchive archive(ofs);
-    SFiltersData data{num_filters, bit_count, capacity, k, false_positive_rate, item_counts, interleaved_bits};
-    archive(data);
+    squirtle::detail::writeAtomically(output_path, [&](std::ostream& output) {
+        squirtle::detail::writeMagic(output, collection_magic);
+        squirtle::detail::writeUnsigned(output, collection_format_version);
+        squirtle::detail::writeUnsigned(output, static_cast<std::uint64_t>(stored_num_filters));
+        squirtle::detail::writeUnsigned(output, static_cast<std::uint64_t>(stored_bit_count));
+        squirtle::detail::writeUnsigned(output, static_cast<std::uint64_t>(stored_capacity));
+        squirtle::detail::writeUnsigned(output, stored_k);
+        squirtle::detail::writeDouble(output, stored_rate);
+        squirtle::detail::writeUnsigned(output, static_cast<std::uint64_t>(counts.size()));
+        squirtle::detail::writeUnsigned(output, static_cast<std::uint64_t>(slices.size()));
+        for (const auto count : counts) squirtle::detail::writeUnsigned(output, count);
+        for (const auto word : slices) squirtle::detail::writeUnsigned(output, word);
+    });
 }
 
-/**
- * @brief Loads an interleaved collection of Bloom filters from a binary file.
- *
- * This method restores the exact interleaved storage layout, item counts,
- * and filter parameters written by `writeToFile`.
- *
- * @param input_path The file path from which the serialized collection of Bloom filters will be read.
- * @throws std::runtime_error If the input file cannot be opened for reading.
- */
 void SFilters::loadFromFile(const std::string& input_path) {
-    std::ifstream ifs(input_path, std::ios::binary);
-    if (!ifs) throw std::runtime_error("Cannot open input file: " + input_path);
+    std::ifstream input(input_path, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open filter collection: " + input_path);
+    squirtle::detail::requireMagic(input, collection_magic);
+    if (squirtle::detail::readUnsigned<std::uint32_t>(input) != collection_format_version) {
+        throw std::runtime_error("Unsupported SFilters format version");
+    }
+    const std::size_t loaded_filters = squirtle::detail::checkedSize(squirtle::detail::readUnsigned<std::uint64_t>(input), "num_filters");
+    const std::size_t loaded_bits = squirtle::detail::checkedSize(squirtle::detail::readUnsigned<std::uint64_t>(input), "bit_count");
+    const std::size_t loaded_capacity = squirtle::detail::checkedSize(squirtle::detail::readUnsigned<std::uint64_t>(input), "capacity");
+    const std::uint8_t loaded_k = squirtle::detail::readUnsigned<std::uint8_t>(input);
+    const double loaded_rate = squirtle::detail::readDouble(input);
+    const std::size_t count_size = squirtle::detail::checkedSize(squirtle::detail::readUnsigned<std::uint64_t>(input), "item_count length");
+    const std::size_t slice_size = squirtle::detail::checkedSize(squirtle::detail::readUnsigned<std::uint64_t>(input), "bit-slice length");
 
-    cereal::BinaryInputArchive archive(ifs);
-    SFiltersData data;
-    archive(data);
+    const std::size_t calculated_bits = BloomFilter::computeBitCount(loaded_capacity, loaded_rate, loaded_k);
+    const std::size_t filter_words = squirtle::detail::wordsForBits(loaded_filters);
+    const std::size_t expected_slices = squirtle::detail::checkedMultiply(loaded_bits, filter_words, "loaded SFilters storage");
+    if (loaded_bits != calculated_bits || count_size != loaded_filters || slice_size != expected_slices) {
+        throw std::runtime_error("Invalid SFilters dimensions");
+    }
+    const std::size_t total_words = count_size > std::numeric_limits<std::size_t>::max() - slice_size
+                                        ? throw std::length_error("loaded SFilters data is too large")
+                                        : count_size + slice_size;
+    const std::size_t byte_count = squirtle::detail::checkedMultiply(total_words, sizeof(std::uint64_t), "loaded SFilters payload");
+    const auto payload_start = input.tellg();
+    input.seekg(0, std::ios::end);
+    const auto payload_end = input.tellg();
+    if (payload_start < 0 || payload_end < payload_start ||
+        static_cast<std::uintmax_t>(payload_end - payload_start) != byte_count) {
+        throw std::runtime_error("Truncated or oversized SFilters payload");
+    }
+    input.seekg(payload_start);
 
-    num_filters = data.num_filters;
-    bit_count = data.bit_count;
-    capacity = data.capacity;
-    k = data.hash_functions;
-    false_positive_rate = data.false_positive_rate;
-    item_counts = std::move(data.item_counts);
-    interleaved_bits = std::move(data.interleaved_bits);
+    std::vector<std::uint64_t> counts(count_size);
+    std::vector<std::uint64_t> slices(slice_size);
+    for (auto& count : counts) count = squirtle::detail::readUnsigned<std::uint64_t>(input);
+    for (auto& word : slices) word = squirtle::detail::readUnsigned<std::uint64_t>(input);
+
+    std::unique_lock lock(mutex);
+    num_filters = loaded_filters;
+    bit_count = loaded_bits;
+    capacity = loaded_capacity;
+    k = loaded_k;
+    false_positive_rate = loaded_rate;
+    item_counts = std::move(counts);
+    bit_slices = std::move(slices);
 }
 
-/**
- * @brief Returns the number of filters stored in the collection.
- *
- * @return The total number of filters in the interleaved collection.
- */
-size_t SFilters::getFilterCount() const {
+std::size_t SFilters::getFilterCount() const {
+    std::shared_lock lock(mutex);
     return num_filters;
 }
 
-/**
- * @brief Checks the presence of a key across all Bloom filters in the collection.
- *
- * This method delegates to `matchBitVector` so that the shared probe
- * computation happens only once before scanning the collection-wide
- * match result.
- *
- * @param key The string key to check for presence across the filters.
- * @return `true` if the key might be present in at least one filter, `false` otherwise.
- */
-std::vector<int> SFilters::matchBitVector(const std::string& key) const {
-    std::vector<int> presence(num_filters, 1);
-    if (num_filters == 0) return presence;
-
-    uint64_t h1, h2;
-    hash128(key.data(), key.size(), 0, h1, h2);
-    const uint64_t base_index = h1 % bit_count;
-    const uint64_t hash2_mod = h2 % bit_count;
-
-    for (uint8_t i = 0; i < k; ++i) {
-        const uint64_t bit_index = (base_index + i * hash2_mod) % bit_count;
-        const size_t word_index = bit_index / 64;
-        const uint64_t bit_mask = 1ULL << (bit_index % 64);
-
-        for (size_t filter_index = 0; filter_index < num_filters; ++filter_index) {
-            if (presence[filter_index] == 1 && !matchWord(filter_index, word_index, bit_mask)) {
-                presence[filter_index] = 0;
-            }
-        }
-    }
-
-    return presence;
-}
-
-/**
- * @brief Checks the presence of a double value across all Bloom filters in the collection.
- *
- * This overload performs the same shared-probe scan as the string overload,
- * but hashes the raw binary representation of the floating-point input.
- *
- * @param value The double-precision floating-point value to check for presence across the filters.
- * @return A `std::vector<int>` where each element is 1 if the `value` might be present in the corresponding filter, and 0 otherwise.
- */
-std::vector<int> SFilters::matchBitVector(double value) const {
-    std::vector<int> presence(num_filters, 1);
-    if (num_filters == 0) return presence;
-
-    uint64_t h1, h2;
-    hash128(&value, sizeof(double), 0, h1, h2);
-    const uint64_t base_index = h1 % bit_count;
-    const uint64_t hash2_mod = h2 % bit_count;
-
-    for (uint8_t i = 0; i < k; ++i) {
-        const uint64_t bit_index = (base_index + i * hash2_mod) % bit_count;
-        const size_t word_index = bit_index / 64;
-        const uint64_t bit_mask = 1ULL << (bit_index % 64);
-
-        for (size_t filter_index = 0; filter_index < num_filters; ++filter_index) {
-            if (presence[filter_index] == 1 && !matchWord(filter_index, word_index, bit_mask)) {
-                presence[filter_index] = 0;
-            }
-        }
-    }
-
-    return presence;
-}
-
-/**
- * @brief Prints a summary of the interleaved filter collection.
- *
- * This summary reports collection-level totals and simple per-filter
- * statistics derived from the interleaved storage metadata.
- */
 void SFilters::printSummary() const {
-    std::cout << "=== SFilters Summary ===\n";
-    std::cout << "Number of filters     : " << num_filters << '\n';
-
-    if (num_filters == 0) {
-        std::cout << "Collection is empty.\n";
-        std::cout << "========================\n";
-        return;
+    std::shared_lock lock(mutex);
+    std::uint64_t total_items{};
+    std::uint64_t min_items = item_counts.empty() ? 0U : std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_items{};
+    for (const auto& count : item_counts) {
+        const auto value = loadAtomic(count);
+        total_items += value;
+        min_items = std::min(min_items, value);
+        max_items = std::max(max_items, value);
     }
-
-    size_t total_items = 0;
-    size_t min_items = std::numeric_limits<size_t>::max();
-    size_t max_items = 0;
-
-    for (size_t count : item_counts) {
-        total_items += count;
-        min_items = std::min(min_items, count);
-        max_items = std::max(max_items, count);
-    }
-
-    const size_t total_bits = bit_count * num_filters;
-    std::cout << "Bit count per filter  : " << bit_count << '\n';
-    std::cout << "Capacity per filter   : " << capacity << '\n';
-    std::cout << "Hash functions (k)    : " << static_cast<int>(k) << '\n';
-    std::cout << "False positive rate   : " << false_positive_rate << '\n';
-    std::cout << "Total items           : " << total_items << '\n';
-    std::cout << "Total bit count       : " << total_bits << " bits (~"
-              << interleaved_bits.size() << " words)\n";
-    std::cout << "Per-filter items      : min " << min_items
-              << " / max " << max_items << '\n';
-    std::cout << "========================\n";
+    std::cout << "=== SFilters Summary ===\n"
+              << "Number of filters     : " << num_filters << '\n'
+              << "Bit count per filter  : " << bit_count << '\n'
+              << "Capacity per filter   : " << capacity << '\n'
+              << "Hash functions (k)    : " << static_cast<unsigned>(k) << '\n'
+              << "False positive rate   : " << false_positive_rate << '\n'
+              << "Total items           : " << total_items << '\n'
+              << "Storage words         : " << bit_slices.size() << '\n'
+              << "Per-filter items      : min " << min_items << " / max " << max_items << '\n'
+              << "========================\n";
 }
