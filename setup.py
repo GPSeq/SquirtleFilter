@@ -7,7 +7,7 @@ import sys
 ext_modules = [
     Pybind11Extension(
         "squirtlefilter",
-        ["src/bindings.cpp", "src/SquirtleFilter.cpp"], 
+        ["src/bindings.cpp", "src/SquirtleFilter.cpp", "src/SFilters.cpp"],
         include_dirs=["include", "src"], 
         language="c++",
         extra_compile_args=["-O3", "-std=c++17"],

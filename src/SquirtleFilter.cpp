@@ -1,10 +1,13 @@
 #include "../include/SquirtleFilter.h"
 #include <fstream>
+#include <algorithm>
 #include <vector>
 #include <atomic>
 #include <stdexcept>
 #include <cassert>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 #include <cereal/archives/binary.hpp>
 
 /**
@@ -75,10 +78,11 @@ void BloomFilter::hash128(const void* key, size_t len, uint64_t seed, uint64_t& 
     const uint64_t c2 = 0x4cf5ad432745937fULL;
 
     // Body - process 16-byte blocks
-    const uint64_t* blocks = reinterpret_cast<const uint64_t*>(data);
     for (int i = 0; i < nblocks; i++) {
-        uint64_t k1 = blocks[2*i];
-        uint64_t k2 = blocks[2*i + 1];
+        uint64_t k1;
+        uint64_t k2;
+        std::memcpy(&k1, data + (2 * i) * sizeof(uint64_t), sizeof(uint64_t));
+        std::memcpy(&k2, data + (2 * i + 1) * sizeof(uint64_t), sizeof(uint64_t));
 
         k1 *= c1;
         k1 = rotl64(k1, 31);
@@ -160,24 +164,34 @@ void BloomFilter::hash128(const void* key, size_t len, uint64_t seed, uint64_t& 
  * `false_positive_rate`, but can be explicitly provided. It is
  * clamped between 1 and 5 in this implementation.
  */
+size_t BloomFilter::computeBitCount(size_t expected_items, double false_positive_rate) {
+    if (expected_items == 0) expected_items = 1;
+    if (false_positive_rate <= 0.0) false_positive_rate = 0.0001;
+    if (false_positive_rate >= 1.0) false_positive_rate = 0.999;
+
+    // m = - (n * ln(p)) / (ln(2)^2)
+    // false positive rate is used to compute the number of bits
+    double m_calc = -(double)expected_items * std::log(false_positive_rate) / (std::log(2) * std::log(2));
+    return std::max<size_t>(64, static_cast<size_t>(std::ceil(m_calc)));
+}
+
 BloomFilter::BloomFilter(size_t expected_items, double false_positive_rate, uint8_t hash_functions)
-    : k(hash_functions), target_false_positive(false_positive_rate), item_count(0), current(nullptr) {
+    : bit_count(0),
+      bits(nullptr),
+      capacity(expected_items == 0 ? 1 : expected_items),
+      item_count(0),
+      k(hash_functions),
+      target_false_positive(false_positive_rate) {
     
     if (k < 1) k = 1;
     if (k > 5) k = 5;
     if (target_false_positive <= 0.0) target_false_positive = 0.0001;
     if (target_false_positive >= 1.0) target_false_positive = 0.999;
 
-    // m = - (n * ln(p)) / (ln(2)^2)
-    // false positive rate is used to compute the number of bits
-    double m_calc = -(double)expected_items * std::log(target_false_positive) / (std::log(2) * std::log(2));
-    bit_count = static_cast<size_t>(std::ceil(m_calc));
+    bit_count = computeBitCount(capacity, target_false_positive);
     size_t num_words = (bit_count + 63) / 64;
-    // bits = std::vector<std::atomic<uint64_t>>(num_words);
     bits = std::make_shared<std::vector<std::atomic<uint64_t>>>(num_words);
     for (auto& word : *bits) word.store(0, std::memory_order_relaxed);
-
-    capacity = expected_items;
 }
 
 /**
@@ -192,6 +206,8 @@ BloomFilter::BloomFilter(size_t expected_items, double false_positive_rate, uint
  * @param len The length of the `key` data in bytes.
  */
 void BloomFilter::insert(const void* key, size_t len) {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+
     // Generate two 64-bit hash values for the key
     uint64_t h1, h2;
     hash128(key, len, 0, h1, h2);
@@ -201,7 +217,7 @@ void BloomFilter::insert(const void* key, size_t len) {
         uint64_t index = (base_index + i * hash2_mod) % bit_count;
     (*bits)[index / 64].fetch_or(1ULL << (index % 64), std::memory_order_relaxed); //  atomicity only, no synchronization with other thread
     }
-    ++item_count;
+    item_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 /**
@@ -224,26 +240,13 @@ BloomFilter& BloomFilter::operator=(BloomFilter&& other) noexcept {
         // Transfer filter configuration
         bit_count = other.bit_count;
         capacity = other.capacity;
-        item_count = other.item_count;
+        item_count.store(other.item_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
         k = other.k;
         target_false_positive = other.target_false_positive;
 
         // Transfer actual bit array
         bits = std::move(other.bits);
-
-        // Cleanup current FilterSegment chain, so far can be skipped! we compress only. 
-        if (current) {
-            FilterSegment* seg = current;
-            while (seg) {
-                FilterSegment* prev = seg->prev;
-                delete seg;
-                seg = prev;
-            }
-        }
-
-        // Transfer any dynamic segments
-        current = other.current;
-        other.current = nullptr;
+        other.item_count.store(0, std::memory_order_relaxed);
     }
     return *this;
 }
@@ -266,6 +269,8 @@ BloomFilter& BloomFilter::operator=(BloomFilter&& other) noexcept {
  * `false` if any relevant bit is not set (item is definitely not present).
  */
 bool BloomFilter::contains(const void* key, size_t len) const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+
     uint64_t h1, h2;
     hash128(key, len, 0, h1, h2);
     uint64_t base_index = h1 % bit_count;
@@ -292,6 +297,7 @@ bool BloomFilter::contains(const void* key, size_t len) const {
  * representing the bit array of the Bloom filter.
  */
 std::shared_ptr<BloomFilter::SQFilter> BloomFilter::returnFilterReference() const{
+    std::shared_lock<std::shared_mutex> lock(mutex);
     return bits; 
 }
 
@@ -311,6 +317,7 @@ std::shared_ptr<BloomFilter::SQFilter> BloomFilter::returnFilterReference() cons
  * bit array.
  */
 BloomFilter::SQFilterRAW BloomFilter::returnFilter() const{
+    std::shared_lock<std::shared_mutex> lock(mutex);
     SQFilterRAW snapshot;
     snapshot.reserve(bits->size());
     for (const auto& atomic_val : *bits) {
@@ -334,7 +341,14 @@ BloomFilter::SQFilterRAW BloomFilter::returnFilter() const{
  * causing the BloomFilter to use the provided bit array for all subsequent operations.
  */
 void BloomFilter::passFilterReference(std::shared_ptr<SQFilter> shared_bits){
+    if (!shared_bits) {
+        throw std::invalid_argument("passFilterReference: shared filter reference must not be null");
+    }
 
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    if (bits && shared_bits->size() != bits->size()) {
+        throw std::invalid_argument("passFilterReference: shared filter size does not match current filter layout");
+    }
     bits = shared_bits;
 }
 
@@ -347,10 +361,11 @@ void BloomFilter::passFilterReference(std::shared_ptr<SQFilter> shared_bits){
  * The `item_count` is also reset to zero.
  */
 void BloomFilter::clear(){
+    std::unique_lock<std::shared_mutex> lock(mutex);
     for (auto& word : *bits) {
         word.store(0, std::memory_order_relaxed);
     }
-    item_count = 0;
+    item_count.store(0, std::memory_order_relaxed);
 }
 
 /**
@@ -365,10 +380,11 @@ void BloomFilter::clear(){
  * @throws std::runtime_error if the output file cannot be opened for writing.
  */
 void BloomFilter::writeSQFilter(const std::string& output_path) const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
     BloomFilterData data;
     data.bit_count = bit_count;
     data.capacity = capacity;
-    data.item_count = item_count;
+    data.item_count = item_count.load(std::memory_order_relaxed);
     data.hash_functions = k;
     data.false_positive_rate = target_false_positive;
 
@@ -402,10 +418,12 @@ void BloomFilter::loadSQFilter(const std::string& input_path) {
     BloomFilterData data;
     archive(data);
 
+    std::unique_lock<std::shared_mutex> lock(mutex);
+
     // Set internal config
     bit_count = data.bit_count;
     capacity = data.capacity;
-    item_count = data.item_count;
+    item_count.store(data.item_count, std::memory_order_relaxed);
     k = data.hash_functions;
     target_false_positive = data.false_positive_rate;
 
@@ -450,10 +468,11 @@ inline uint64_t popcount(uint64_t x) {
  * false positives.
  */
 void BloomFilter::printSummary() const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
     std::cout << "=== Bloom Filter Summary ===\n";
     std::cout << "Bit count             : " << bit_count << '\n';
     std::cout << "Capacity              : " << capacity << '\n';
-    std::cout << "Item count            : " << item_count << '\n';
+    std::cout << "Item count            : " << item_count.load(std::memory_order_relaxed) << '\n';
     std::cout << "Hash functions (k)    : " << static_cast<int>(k) << '\n';
     std::cout << "False positive rate   : " << target_false_positive << '\n';
     std::cout << "Bit vector size       : " << bits->size() << " words (64-bit each)\n";
@@ -479,10 +498,11 @@ void BloomFilter::printSummary() const {
  * the full bit array content of the current Bloom filter instance.
  */
 BloomFilter::BloomFilterData BloomFilter::exportData() const {
+    std::shared_lock<std::shared_mutex> lock(mutex);
     BloomFilterData data;
     data.bit_count = bit_count;
     data.capacity = capacity;
-    data.item_count = item_count;
+    data.item_count = item_count.load(std::memory_order_relaxed);
     data.hash_functions = k;
     data.false_positive_rate = target_false_positive;
 
@@ -506,9 +526,10 @@ BloomFilter::BloomFilterData BloomFilter::exportData() const {
  * the configuration and bit array state to be imported into this Bloom filter.
  */
 void BloomFilter::importData(const BloomFilterData& data) {
+    std::unique_lock<std::shared_mutex> lock(mutex);
     bit_count = data.bit_count;
     capacity = data.capacity;
-    item_count = data.item_count;
+    item_count.store(data.item_count, std::memory_order_relaxed);
     k = data.hash_functions;
     target_false_positive = data.false_positive_rate;
 
@@ -538,11 +559,10 @@ BloomFilter::BloomFilter(BloomFilter&& other) noexcept
     : bit_count(other.bit_count),
       bits(std::move(other.bits)),
       capacity(other.capacity),
-      item_count(other.item_count),
+      item_count(other.item_count.load(std::memory_order_relaxed)),
       k(other.k),
-      target_false_positive(other.target_false_positive),
-      current(other.current)
+      target_false_positive(other.target_false_positive)
 {
     std::unique_lock<std::shared_mutex> lock_other(other.mutex);
-    other.current = nullptr;
+    other.item_count.store(0, std::memory_order_relaxed);
 }

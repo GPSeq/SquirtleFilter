@@ -2,6 +2,10 @@
 #define SFILTERS_H
 
 #include "SquirtleFilter.h"
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <limits>
 #include <vector>
 #include <string>
 #include <iomanip>
@@ -40,8 +44,8 @@ public:
     template <typename T>
     bool contains(const T& key) const;
 
-    // Get underlying filters (const)
-    const std::vector<BloomFilter>& getFilters() const;
+    // Return the number of filters
+    size_t getFilterCount() const;
 
     template <typename T>
     std::vector<size_t> matchFilters(const T& key) const;
@@ -52,7 +56,34 @@ public:
     void printSummary() const;
 
 private:
-    std::vector<BloomFilter> filters;
+    struct SFiltersData {
+        size_t num_filters;
+        size_t bit_count;
+        size_t capacity;
+        uint8_t hash_functions;
+        double false_positive_rate;
+        std::vector<size_t> item_counts;
+        std::vector<uint64_t> interleaved_bits;
+
+        template <class Archive>
+        void serialize(Archive& ar) {
+            ar(num_filters, bit_count, capacity, hash_functions, false_positive_rate, item_counts, interleaved_bits);
+        }
+    };
+
+    size_t num_filters = 0;
+    size_t bit_count = 0;
+    size_t capacity = 0;
+    uint8_t k = 0;
+    double false_positive_rate = 0.01;
+    std::vector<size_t> item_counts;
+    std::vector<uint64_t> interleaved_bits;
+
+    size_t wordCountPerFilter() const;
+    size_t interleavedOffset(size_t word_index, size_t filter_index) const;
+    bool matchWord(size_t filter_index, size_t word_index, uint64_t bit_mask) const;
+    void setWord(size_t filter_index, size_t word_index, uint64_t bit_mask);
+    void validateIndex(size_t index) const;
 };
 
 #include "SFilters.tpp"  // for template impl

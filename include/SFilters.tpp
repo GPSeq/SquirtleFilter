@@ -14,8 +14,9 @@
  */
 template <typename T>
 bool SFilters::contains(const T& key) const {
-    for (const auto& filter : filters) {
-        if (filter.contains(key)) return true;
+    const auto presence = matchBitVector(key);
+    for (int match : presence) {
+        if (match == 1) return true;
     }
     return false;
 }
@@ -37,9 +38,10 @@ bool SFilters::contains(const T& key) const {
  */
 template <typename T>
 std::vector<size_t> SFilters::matchFilters(const T& key) const {
+    const auto presence = matchBitVector(key);
     std::vector<size_t> matched;
-    for (size_t i = 0; i < filters.size(); ++i) {
-        if (filters[i].contains(key)) {
+    for (size_t i = 0; i < presence.size(); ++i) {
+        if (presence[i] == 1) {
             matched.push_back(i);
         }
     }

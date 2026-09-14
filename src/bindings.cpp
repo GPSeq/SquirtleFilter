@@ -6,7 +6,7 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(sfcollection, m) {
+PYBIND11_MODULE(squirtlefilter, m) {
     py::class_<BloomFilter>(m, "SquirtleFilter")
         .def(py::init<size_t, double, uint8_t>(), "Constructor")
         .def("insert", static_cast<void (BloomFilter::*)(const std::string&)>(&BloomFilter::insert), "Insert string key")
@@ -27,6 +27,12 @@ PYBIND11_MODULE(sfcollection, m) {
         .def("write_to_file", &SFilters::writeToFile, "Write all filters to file")
         .def("load_from_file", &SFilters::loadFromFile, "Load filters from file")
         .def("print_summary_collection", &SFilters::printSummary, "Print summary of the collection")
+        .def("contains_string", [](const SFilters& self, const std::string& key) {
+            return self.contains(key);
+        }, "Check presence across all filters for string input")
+        .def("contains_double", [](const SFilters& self, double value) {
+            return self.contains(value);
+        }, "Check presence across all filters for double input")
 
         .def("match_bit_vector_string", [](const SFilters& self, const std::string& key) {
             std::vector<int> result = self.matchBitVector(key);
@@ -39,6 +45,6 @@ PYBIND11_MODULE(sfcollection, m) {
         }, "Return bit vector for double input")
 
         .def("get_filter_count", [](const SFilters& self) {
-            return self.getFilters().size();
+            return self.getFilterCount();
         }, "Return number of filters");
 }

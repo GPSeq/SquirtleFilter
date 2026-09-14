@@ -5,7 +5,6 @@
 #include <atomic>
 #include <cstdint>
 #include <cmath>
-#include <mutex>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -29,6 +28,7 @@ class BloomFilter {
 public:
 
     BloomFilter(size_t expected_items = 1000, double false_positive_rate = 0.01, uint8_t hash_functions = 3);
+    ~BloomFilter() = default;
     BloomFilter(const BloomFilter&) = delete;
     BloomFilter& operator=(const BloomFilter&) = delete;
 
@@ -72,6 +72,19 @@ public:
 
     void printSummary() const;
 
+    /**
+     * @brief Computes the number of bits required for a Bloom filter.
+     *
+     * This helper centralizes the sizing formula so that both `BloomFilter`
+     * and higher-level structures such as `SFilters` can derive identical
+     * layouts for the same capacity and false-positive target.
+     *
+     * @param expected_items The approximate number of elements the filter is expected to hold.
+     * @param false_positive_rate The target false-positive rate.
+     * @return The total number of bits required for the filter.
+     */
+    static size_t computeBitCount(size_t expected_items, double false_positive_rate);
+
 
     struct BloomFilterData {
         size_t bit_count;
@@ -92,30 +105,10 @@ public:
     void importData(const BloomFilterData& data);
 
 private:
-    struct FilterSegment {
-        size_t bit_count;            // number of bits in this filter
-        size_t capacity;            // max number of items this filter was designed for
-        double false_positive_rate; // target false positive rate for this filter when at capacity
-        std::atomic<size_t> count;  // number of items inserted into this filter
-        std::unique_ptr<std::atomic<uint64_t>[]> bits; // bit array (atomic for thread-safe bit set)
-        FilterSegment* prev;        // pointer to previous (older) filter segment in the chain
-
-        FilterSegment(size_t bitCount, size_t cap, double fpr)
-            : bit_count(bitCount), capacity(cap), false_positive_rate(fpr),
-            count(0), bits(new std::atomic<uint64_t>[(bitCount + 63) / 64]), prev(nullptr)
-        {
-            size_t word_count = (bit_count + 63) / 64;
-            auto* rawBits = bits.get();
-            for (size_t i = 0; i < word_count; ++i) {
-                rawBits[i].store(0, std::memory_order_relaxed);
-            }
-        }
-    };
     size_t bit_count;
-    //std::vector<std::atomic<uint64_t>> bits;
     std::shared_ptr<std::vector<std::atomic<uint64_t>>> bits;
     size_t capacity;
-    size_t item_count;
+    std::atomic<size_t> item_count;
 
     // Hash a key to a 128-bit (two 64-bit) result using a high-performance hash (MurmurHash3).
     // We use two 64-bit hashes to generate multiple indices via double hashing.
@@ -123,10 +116,7 @@ private:
 
     uint8_t k;                     // number of hash functions
     double target_false_positive;  // desired maximum false positive rate for the Bloom filter
-    const double growth_factor = 2.0;      // factor to grow the filter size (capacity) when expanding
-    const double error_decay = 0.5;        // factor to decrease false positive rate in each new filter
-    mutable std::shared_mutex mutex; // mutex for thread-safe access (read for contains, write for resizing)
-    FilterSegment* current; 
+    mutable std::shared_mutex mutex; // mutex for thread-safe access (read for queries/inserts, write for state swaps)
 };
 
 #endif

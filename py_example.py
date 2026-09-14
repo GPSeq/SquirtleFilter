@@ -2,8 +2,8 @@ import sys
 import resource
 import gc
 sys.path.append("./build/")
-import sfcollection
-print(dir(sfcollection.SquirtleFilter))
+import squirtlefilter
+print(dir(squirtlefilter.SquirtleFilter))
 import time
 import psutil
 import os
@@ -34,15 +34,15 @@ def print_stats(label, start_time, tp, fp, tn, fn):
 def single_string_test():
     print("[TEST] Single SquirtleFilter (String)")
     n = 200000000
-    f = sfcollection.SquirtleFilter(n, 0.001, 5)
+    f = squirtlefilter.SquirtleFilter(n, 0.001, 5)
     for i in range(n):
         f.insert(f"RQTGRPHGFLRKFGL{i}")
     f.write("singleSFStringsInsertionPY.sf")
 
-    f2 = sfcollection.SquirtleFilter(100, 0.001, 5)
-    f2.print_summary()
+    f2 = squirtlefilter.SquirtleFilter(100, 0.001, 5)
+    f2.print_summary_single()
     f2.load("singleSFStringsInsertionPY.sf")
-    f2.print_summary()
+    f2.print_summary_single()
 
     start = time.time()
     TP = sum(f2.contains(f"RQTGRPHGFLRKFGL{i}") for i in range(n))
@@ -55,12 +55,12 @@ def single_string_test():
 def single_double_test():
     print("[TEST] Single SquirtleFilter (Double)")
     n = 200000000
-    f = sfcollection.SquirtleFilter(n, 0.001, 5)
+    f = squirtlefilter.SquirtleFilter(n, 0.001, 5)
     for i in range(n):
         f.insert_double(8565948.2514 + i * 0.253458)
     f.write("singleSFDoubleInsertionPY.sf")
 
-    f2 = sfcollection.SquirtleFilter(200000000, 0.001, 5)
+    f2 = squirtlefilter.SquirtleFilter(200000000, 0.001, 5)
     f2.load("singleSFDoubleInsertionPY.sf")
 
     start = time.time()
@@ -76,7 +76,7 @@ def multi_string_test():
     n = 200000000
     filters = 10
     per_filter = n // filters
-    f = sfcollection.SFilters()
+    f = squirtlefilter.SFilters()
     f.initialize(filters, per_filter, 0.001, 5)
 
     for j in range(filters):
@@ -84,7 +84,7 @@ def multi_string_test():
             f.insert_string(j, f"RQTGRPHGFLRKFGL{i}")
     f.write_to_file("singleSFStringsInsertionPY.sfs")
 
-    f2 = sfcollection.SFilters()
+    f2 = squirtlefilter.SFilters()
     f2.load_from_file("singleSFStringsInsertionPY.sfs")
 
     start = time.time()
@@ -100,7 +100,7 @@ def multi_double_test():
     n = 100_000
     filters = 10
     per_filter = n // filters
-    f = sfcollection.SFilters()
+    f = squirtlefilter.SFilters()
     f.initialize(filters, per_filter, 0.001, 5)
 
     for j in range(filters):
@@ -108,7 +108,7 @@ def multi_double_test():
             f.insert_double(j, 8565948.2514 + i * 0.253458)
     f.write_to_file("multiSFDoubleInsertionPY.sfs")
 
-    f2 = sfcollection.SFilters()
+    f2 = squirtlefilter.SFilters()
     f2.load_from_file("multiSFDoubleInsertionPY.sfs")
 
     start = time.time()
@@ -123,7 +123,7 @@ def multi_double_test_real():
     n = 150
     filters = 2000_000
     per_filter = n
-    f = sfcollection.SFilters()
+    f = squirtlefilter.SFilters()
     f.initialize(filters, per_filter, 0.001, 5)
 
     for j in range(filters):
@@ -132,7 +132,7 @@ def multi_double_test_real():
     f.write_to_file("multiSFDoubleInsertionPY.sfs")
     f = None
     gc.collect()
-    f2 = sfcollection.SFilters()
+    f2 = squirtlefilter.SFilters()
     f2.load_from_file("multiSFDoubleInsertionPY.sfs")
 
     start = time.time()

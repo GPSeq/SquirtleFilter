@@ -44,6 +44,14 @@ TEST(BloomFilterTest, PassFilterReferenceShared) {
     EXPECT_TRUE(bf2.contains("x", 1));
 }
 
+TEST(BloomFilterTest, PassFilterReferenceRejectsMismatchedLayout) {
+    BloomFilter bf1(100, 0.01, 3);
+    BloomFilter bf2(1000, 0.01, 3);
+    auto ref = bf2.returnFilterReference();
+
+    EXPECT_THROW(bf1.passFilterReference(ref), std::invalid_argument);
+}
+
 TEST(BloomFilterTest, ClearResetsBits) {
     BloomFilter bf(100, 0.01, 3);
     bf.insert("a", 1);
@@ -93,7 +101,7 @@ TEST(BloomFilterTest, MoveAssignmentTransfersOwnership) {
 TEST(SFiltersTest, InitializeCreatesCorrectCount) {
     SFilters sf;
     sf.initialize(5, 100, 0.01, 3);
-    EXPECT_EQ(sf.getFilters().size(), 5);
+    EXPECT_EQ(sf.getFilterCount(), 5);
 }
 
 TEST(SFiltersTest, InsertAndContainsString) {
@@ -117,6 +125,19 @@ TEST(SFiltersTest, MatchFiltersReturnsCorrectIndex) {
     auto result = sf.matchFilters(std::string("KEY"));
     ASSERT_EQ(result.size(), 1);
     EXPECT_EQ(result[0], 2);
+}
+
+TEST(SFiltersTest, InterleavedMatchVectorCanMatchMultipleFilters) {
+    SFilters sf;
+    sf.initialize(3, 100, 0.01, 3);
+    sf.insert(0, std::string("shared"));
+    sf.insert(2, std::string("shared"));
+
+    auto vec = sf.matchBitVector("shared");
+    ASSERT_EQ(vec.size(), 3);
+    EXPECT_EQ(vec[0], 1);
+    EXPECT_EQ(vec[1], 0);
+    EXPECT_EQ(vec[2], 1);
 }
 
 TEST(SFiltersTest, MatchBitVectorString) {
